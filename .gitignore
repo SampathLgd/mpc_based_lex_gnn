@@ -1,0 +1,14 @@
+echo "
+# Python virtual environment
+venv_lex/
+
+# Log files
+*.log
+node0.log
+node1.log
+node2.log
+
+# Python cache
+__pycache__/
+*.pyc
+" > .gitignore
