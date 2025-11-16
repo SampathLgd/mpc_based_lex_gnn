@@ -45,6 +45,117 @@ def send(node_id, msg, timeout=5.0, retry=6):
     raise RuntimeError(f"Failed to send to node {node_id}: {last_exc}")
 
 
+# ... after send() function ...
+
+def rpc_add(key_A, key_B, store_as):
+    """Instructs all nodes to add shares [A] + [B] and store as [store_as]"""
+    print(f"Instructing nodes: [ {store_as} ] = [ {key_A} ] + [ {key_B} ]")
+    req = {
+        'type': 'LOCAL_ADD',
+        'key_A': key_A,
+        'key_B': key_B,
+        'store_as': store_as
+    }
+    for nid in range(3):
+        r = send(nid, req)
+        if not r.get('ok'):
+            raise Exception(f"node{nid} LOCAL_ADD failed: {r}")
+    return True
+
+def rpc_sub(key_A, key_B, store_as):
+    """Instructs all nodes to subtract shares [A] - [B] and store as [store_as]"""
+    print(f"Instructing nodes: [ {store_as} ] = [ {key_A} ] - [ {key_B} ]")
+    req = {
+        'type': 'LOCAL_SUB',
+        'key_A': key_A,
+        'key_B': key_B,
+        'store_as': store_as
+    }
+    for nid in range(3):
+        r = send(nid, req)
+        if not r.get('ok'):
+            raise Exception(f"node{nid} LOCAL_SUB failed: {r}")
+    return True
+
+def rpc_hadamard_mul(X_key, Y_key, a_key, b_key, c_key, store_as):
+    """
+    Performs secure element-wise multiplication [Z] = [X] .* [Y]
+    using Beaver triples [a], [b], [c] where c = a .* b.
+    """
+    print(f"Instructing nodes: [ {store_as} ] = [ {X_key} ] .* [ {Y_key} ]")
+    
+    # 1. Compute D_i = [X_i] - [a_i] and E_i = [Y_i] - [b_i] on each node
+    d_parts=[]; e_parts=[]
+    for nid in range(3):
+        # We can reuse the MAT_COMPUTE_D_E RPC since it's just element-wise subtraction
+        r = send(nid, {'type':'MAT_COMPUTE_D_E', 'X_key': X_key,'Y_key': Y_key,'a_key': a_key,'b_key': b_key})
+        if not r.get('ok'): raise RuntimeError(f"node{nid} MAT_COMPUTE_D_E failed: {r}")
+        d_parts.append(np.array(r['d_i'], dtype=np.uint64))
+        e_parts.append(np.array(r['e_i'], dtype=np.uint64))
+
+    # 2. Reconstruct D, E
+    D_u = reconstruct_elementwise(d_parts)
+    E_u = reconstruct_elementwise(e_parts)
+    D = uint64_to_signed_int64(D_u)
+    E = uint64_to_signed_int64(E_u)
+
+    # 3. Compute public DE = D .* E (element-wise) and truncate
+    # This is scale^2, needs truncation
+    DE_prod = (D.astype(np.int64) * E.astype(np.int64)).astype(np.int64)
+    # --- MODIFIED ---
+    DE = np.right_shift(DE_prod, FRAC_BITS).astype(np.int64)
+    DE_u = DE.view(np.uint64)
+    DE_sh = share_uint64(DE_u) # Share the truncated result
+
+    # 4. Send D, E, DE_sh to nodes and apply
+    for nid in range(3):
+        msg = {'type':'APPLY_HADAMARD_DE_FIXED', 
+               'D': D.tolist(), 
+               'E': E.tolist(), 
+               'DE_share': np.array(DE_sh[nid], dtype=np.uint64),
+               'a_key': a_key,
+               'b_key': b_key,
+               'c_key': c_key,
+               'store_as': store_as}
+        r = send(nid, msg)
+        if not r.get('ok'):
+            dbg = send(nid, {'type':'DEBUG_KEYS'})
+            raise RuntimeError(f"node{nid} APPLY_HADAMARD_DE_FIXED failed: {r}; keys: {dbg}")
+    
+    time.sleep(0.05) # Give nodes time to compute
+    return True
+
+def rpc_scalar_mul(key_in, scalar_float, store_as):
+    """
+    Performs secure public scalar multiplication [Y] = y * [X]
+    """
+    print(f"Instructing nodes: [ {store_as} ] = {scalar_float} * [ {key_in} ]")
+    
+    # Convert the public float to fixed-point
+    scalar_fixed = np.round(scalar_float * SCALE).astype(np.int64)
+    
+    req = {
+        'type': 'PUBLIC_SCALAR_MUL',
+        'key_in': key_in,
+        'scalar_fixed': scalar_fixed.item(), # Send as a standard Python int
+        'store_as': store_as
+    }
+    
+    for nid in range(3):
+        r = send(nid, req)
+        if not r.get('ok'):
+            raise Exception(f"node{nid} PUBLIC_SCALAR_MUL failed: {r}")
+    
+    time.sleep(0.05) # Give nodes time to compute
+    return True
+
+def rpc_get_node(nid, key):
+    """Gets a share from a single node"""
+    r = send(nid, {'type':'GET', 'key':key})
+    if not r.get('ok') or r.get('share') is None:
+        dbg = send(nid, {'type':'DEBUG_KEYS'})
+        raise Exception(f"node{nid} GET {key} failed: {r}; keys: {dbg}")
+    return np.array(r['share'], dtype=np.uint64)
 
 def share_uint64(x_uint):
     # Use small random splits for simulation to avoid huge intermediate products.
@@ -109,8 +220,8 @@ a = np.random.randint(-rand_bound, rand_bound, size=(M,K)).astype(np.int64)
 b = np.random.randint(-rand_bound, rand_bound, size=(K,N)).astype(np.int64)
 a_fixed = (a * SCALE).astype(np.int64); b_fixed = (b * SCALE).astype(np.int64)
 prod_ab = a_fixed.dot(b_fixed).astype(np.int64)
-add = (1 << (FRAC_BITS - 1))
-c_fixed = np.right_shift(prod_ab + add, FRAC_BITS).astype(np.int64)
+# --- MODIFIED ---
+c_fixed = np.right_shift(prod_ab, FRAC_BITS).astype(np.int64)
 a_u = a_fixed.view(np.uint64); b_u = b_fixed.view(np.uint64); c_u = c_fixed.view(np.uint64)
 a_sh = share_uint64(a_u); b_sh = share_uint64(b_u); c_sh = share_uint64(c_u)
 
@@ -155,7 +266,8 @@ D = uint64_to_signed_int64(D_u); E = uint64_to_signed_int64(E_u)
 
 # compute DE public (trunc(D@E))
 DE_prod = D.dot(E).astype(np.int64)
-DE = np.right_shift(DE_prod + (1 << (FRAC_BITS - 1)), FRAC_BITS).astype(np.int64)
+# --- MODIFIED ---
+DE = np.right_shift(DE_prod, FRAC_BITS).astype(np.int64)
 DE_u = DE.view(np.uint64)
 DE_sh = share_uint64(DE_u)
 
@@ -201,3 +313,160 @@ print("Reconstructed Z (rounded clear int view):")
 print(Z_clear)
 print("Expected A·B (clear):")
 print(A.dot(B))
+
+# --- ADD THIS TEST BLOCK FOR LOCAL_ADD ---
+print("\n--- Testing LOCAL_ADD ---")
+# Test: compute [Z] + [Z] and store as [Z_plus_Z]
+try:
+    rpc_add('Z', 'Z', 'Z_plus_Z')
+    
+    # Get the shares of the new result
+    Z_plus_Z_shares = [ rpc_get_node(i, 'Z_plus_Z') for i in range(3) ]
+    Z_plus_Z_recon_u = reconstruct_elementwise(Z_plus_Z_shares)
+    
+    # Compare to cleartext
+    # We already have Z_u from the matmul test
+    Z_plus_Z_expected_u = (Z_u.astype(np.uint64) + Z_u.astype(np.uint64)).astype(np.uint64)
+    
+    print("Reconstructed Z+Z (uint64 view):")
+    print(Z_plus_Z_recon_u)
+    print("Expected Z+Z (uint64 view):")
+    print(Z_plus_Z_expected_u)
+    
+    if np.array_equal(Z_plus_Z_recon_u, Z_plus_Z_expected_u):
+        print("✅ LOCAL_ADD test PASSED!")
+    else:
+        print("❌ LOCAL_ADD test FAILED!")
+        
+except Exception as e:
+    print(f"❌ LOCAL_ADD test FAILED with error: {e}")
+# --- END OF TEST BLOCK ---
+
+print("\n--- Testing LOCAL_SUB ---")
+# Test: compute [Z_plus_Z] - [Z] and store as [Z_sub_test]
+try:
+    rpc_sub('Z_plus_Z', 'Z', 'Z_sub_test')
+    
+    # Get the shares of the new result
+    Z_sub_shares = [ rpc_get_node(i, 'Z_sub_test') for i in range(3) ]
+    Z_sub_recon_u = reconstruct_elementwise(Z_sub_shares)
+    
+    # Compare to cleartext
+    # The expected result is just Z_u
+    Z_sub_expected_u = Z_u.astype(np.uint64)
+    
+    print("Reconstructed (Z+Z)-Z (uint64 view):")
+    print(Z_sub_recon_u)
+    print("Expected Z (uint64 view):")
+    print(Z_sub_expected_u)
+    
+    if np.array_equal(Z_sub_recon_u, Z_sub_expected_u):
+        print("✅ LOCAL_SUB test PASSED!")
+    else:
+        print("❌ LOCAL_SUB test FAILED!")
+        
+except Exception as e:
+    print(f"❌ LOCAL_SUB test FAILED with error: {e}")
+    
+    
+print("\n--- Testing HADAMARD_MUL ---")
+try:
+    # 1. Generate new triples a, b, c where c = (a .* b) >> FRAC_BITS
+    # We will test [Z_squared] = [Z] .* [Z]
+    # Z has shape (M, N)
+    a_h = np.random.randint(-rand_bound, rand_bound, size=(M,N)).astype(np.int64)
+    b_h = np.random.randint(-rand_bound, rand_bound, size=(M,N)).astype(np.int64)
+    
+    a_h_fixed = (a_h * SCALE).astype(np.int64)
+    b_h_fixed = (b_h * SCALE).astype(np.int64)
+    
+    # c = a .* b (element-wise), then truncate
+    prod_ab_h = (a_h_fixed.astype(np.int64) * b_h_fixed.astype(np.int64)).astype(np.int64)
+    # --- MODIFIED ---
+    c_h_fixed = np.right_shift(prod_ab_h, FRAC_BITS).astype(np.int64)
+    
+    a_h_u = a_h_fixed.view(np.uint64)
+    b_h_u = b_h_fixed.view(np.uint64)
+    c_h_u = c_h_fixed.view(np.uint64)
+    
+    a_h_sh = share_uint64(a_h_u)
+    b_h_sh = share_uint64(b_h_u)
+    c_h_sh = share_uint64(c_h_u)
+
+    # 2. Store these triples on the nodes
+    print("Storing Hadamard triples (a_h, b_h, c_h)...")
+    for nid in range(3):
+        for key,data in [('a_h', a_h_sh[nid]), ('b_h', b_h_sh[nid]), ('c_h', c_h_sh[nid])]:
+            r = send(nid, {'type':'STORE','key':key,'share':data})
+            if not r.get('ok'): raise RuntimeError(f"node{nid} STORE {key} failed {r}")
+
+    # 3. Run the Hadamard RPC
+    rpc_hadamard_mul('Z', 'Z', 'a_h', 'b_h', 'c_h', 'Z_squared')
+
+    # 4. Get the shares and reconstruct
+    Z_squared_shares = [ rpc_get_node(i, 'Z_squared') for i in range(3) ]
+    Z_squared_recon_u = reconstruct_elementwise(Z_squared_shares)
+    
+    # 5. Compare to cleartext
+    # Z_u is from the matmul test
+    Z_fixed = uint64_to_signed_int64(Z_u)
+    # Z_squared_expected = (Z_fixed * Z_fixed) >> FRAC_BITS
+    Z_squared_prod = (Z_fixed.astype(np.int64) * Z_fixed.astype(np.int64)).astype(np.int64)
+    # --- MODIFIED ---
+    Z_squared_expected_fixed = np.right_shift(Z_squared_prod, FRAC_BITS).astype(np.int64)
+    Z_squared_expected_u = Z_squared_expected_fixed.view(np.uint64)
+    
+    print("Reconstructed Z*Z (uint64 view):")
+    print(Z_squared_recon_u)
+    print("Expected Z*Z (uint64 view):")
+    print(Z_squared_expected_u)
+    
+    # Use a tolerance for fixed-point comparisons
+    diff = np.abs(Z_squared_recon_u.view(np.int64) - Z_squared_expected_u.view(np.int64))
+    if np.all(diff <= 1): # Allow off-by-one errors from intermediate shifts
+        print("✅ HADAMARD_MUL test PASSED! (with tolerance)")
+    else:
+        print("❌ HADAMARD_MUL test FAILED!")
+        
+except Exception as e:
+    print(f"❌ HADAMARD_MUL test FAILED with error: {e}")
+
+print("\n--- Testing PUBLIC_SCALAR_MUL ---")
+try:
+    # 1. Test: compute [Z_times_3] = 3.5 * [Z]
+    public_scalar = 3.5
+    rpc_scalar_mul('Z', public_scalar, 'Z_times_3point5')
+
+    # 2. Get the shares and reconstruct
+    Z_times_3_shares = [ rpc_get_node(i, 'Z_times_3point5') for i in range(3) ]
+    Z_times_3_recon_u = reconstruct_elementwise(Z_times_3_shares)
+    
+    # 3. Compare to cleartext
+    Z_fixed = uint64_to_signed_int64(Z_u)
+    scalar_fixed = np.round(public_scalar * SCALE).astype(np.int64)
+    
+    # Expected result: trunc( (Z_fixed * 3.5_fixed) )
+    prod = (Z_fixed.astype(np.int64) * scalar_fixed).astype(np.int64)
+    # --- MODIFIED ---
+    expected_fixed = np.right_shift(prod, FRAC_BITS).astype(np.int64)
+    expected_u = expected_fixed.view(np.uint64)
+    
+    print("Reconstructed 3.5*Z (uint64 view):")
+    print(Z_times_3_recon_u)
+    print("Expected 3.5*Z (uint64 view):")
+    print(expected_u)
+    
+    if np.array_equal(Z_times_3_recon_u, expected_u):
+        print("✅ PUBLIC_SCALAR_MUL test PASSED!")
+    else:
+        # Check for off-by-one
+        diff = np.abs(Z_times_3_recon_u.view(np.int64) - expected_u.view(np.int64))
+        if np.all(diff <= 1):
+            print("✅ PUBLIC_SCALAR_MUL test PASSED! (with tolerance)")
+        else:
+            print("❌ PUBLIC_SCALAR_MUL test FAILED!")
+            print("Diff:", diff)
+        
+except Exception as e:
+    print(f"❌ PUBLIC_SCALAR_MUL test FAILED with error: {e}")
+# --- END OF TEST BLOCK ---

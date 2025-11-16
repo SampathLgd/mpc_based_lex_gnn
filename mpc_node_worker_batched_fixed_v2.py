@@ -111,7 +111,126 @@ def handle_req(conn, addr, node_id):
 
         if typ == 'DEBUG_KEYS':
             send_msg(conn, {'ok': True, 'keys_meta': node_state.meta}); return
+        
+        if typ == 'LOCAL_ADD':
+            key_A = req['key_A']
+            key_B = req['key_B']
+            store_as = req['store_as']
+            
+            A_sh = node_state.store.get(key_A)
+            B_sh = node_state.store.get(key_B)
+            
+            if A_sh is None or B_sh is None:
+                send_msg(conn, {'ok': False, 'err': f'Missing key for LOCAL_ADD: A={key_A}, B={key_B}'})
+                return
+            
+            # This is the MPC logic for local addition, same as your simulator
+            C_sh = (A_sh.astype(np.uint64) + B_sh.astype(np.uint64)).astype(np.uint64)
+            
+            node_state.store[store_as] = C_sh
+            node_state.meta[store_as] = {'shape': tuple(C_sh.shape), 'dtype': 'uint64'}
+            send_msg(conn, {'ok': True})
+            return
+        
+        if typ == 'LOCAL_SUB':
+            key_A = req['key_A']
+            key_B = req['key_B']
+            store_as = req['store_as']
+            
+            A_sh = node_state.store.get(key_A)
+            B_sh = node_state.store.get(key_B)
+            
+            if A_sh is None or B_sh is None:
+                send_msg(conn, {'ok': False, 'err': f'Missing key for LOCAL_SUB: A={key_A}, B={key_B}'})
+                return
+            
+            # This is the MPC logic for local subtraction
+            C_sh = (A_sh.astype(np.uint64) - B_sh.astype(np.uint64)).astype(np.uint64)
+            
+            node_state.store[store_as] = C_sh
+            node_state.meta[store_as] = {'shape': tuple(C_sh.shape), 'dtype': 'uint64'}
+            send_msg(conn, {'ok': True})
+            return
+        
+        if typ == 'APPLY_HADAMARD_DE_FIXED':
+            D_list = req['D']; E_list = req['E']
+            DE_share = np.array(req['DE_share'], dtype=np.uint64)
+            a_u = node_state.store.get(req['a_key'])
+            b_u = node_state.store.get(req['b_key'])
+            c_u = node_state.store.get(req['c_key'])
+            
+            if a_u is None or b_u is None or c_u is None:
+                send_msg(conn, {'ok': False, 'err': 'missing a/b/c on node; keys:' + str(list(node_state.store.keys()))})
+                return
 
+            # Convert shares to signed int64
+            a_i = uint64_to_int64_arr(a_u)
+            b_i = uint64_to_int64_arr(b_u)
+            c_i = uint64_to_int64_arr(c_u)
+            D = np.array(D_list, dtype=np.int64)
+            E = np.array(E_list, dtype=np.int64)
+            de_i = uint64_to_int64_arr(DE_share)
+
+            # Shape check
+            if D.shape != a_i.shape or E.shape != b_i.shape or a_i.shape != c_i.shape or c_i.shape != de_i.shape:
+                send_msg(conn, {'ok': False, 'err': f'shape mismatch: D{D.shape}, E{E.shape}, a{a_i.shape}, b{b_i.shape}, c{c_i.shape}, de{de_i.shape}'})
+                return
+
+            # Compute D * b_i and a_i * E (element-wise)
+            # These are in scale^2 domain
+            Db_i = (D.astype(np.int64) * b_i.astype(np.int64)).astype(np.int64)
+            aE_i = (a_i.astype(np.int64) * E.astype(np.int64)).astype(np.int64)
+
+            # Truncation (simple right-shift, no rounding)
+            # --- MODIFIED ---
+            
+            # Truncate Db_i and aE_i
+            # --- MODIFIED ---
+            t_db = np.right_shift(Db_i, FRAC_BITS).astype(np.int64)
+            # --- MODIFIED ---
+            t_aE = np.right_shift(aE_i, FRAC_BITS).astype(np.int64)
+            
+            # z = c + D*b + a*E + DE (all as shares)
+            # We add as int64 to handle negatives
+            z_i = c_i.astype(np.int64) + t_db + t_aE + de_i.astype(np.int64)
+            
+            # Clamp to int64 range
+            z_i = np.clip(z_i, INT64_MIN, INT64_MAX)
+
+            node_state.store[req['store_as']] = z_i.view(np.uint64)
+            node_state.meta[req['store_as']] = {'shape': tuple(z_i.shape), 'dtype': 'uint64'}
+            send_msg(conn, {'ok': True})
+            return
+        
+        if typ == 'PUBLIC_SCALAR_MUL':
+            key_in = req['key_in']
+            scalar_fixed = np.int64(req['scalar_fixed']) # Public scalar, already in fixed-point
+            store_as = req['store_as']
+            
+            X_sh_u = node_state.store.get(key_in)
+            
+            if X_sh_u is None:
+                send_msg(conn, {'ok': False, 'err': f'Missing key for PUBLIC_SCALAR_MUL: {key_in}'})
+                return
+            
+            # Convert share to signed int64
+            X_sh_i = uint64_to_int64_arr(X_sh_u)
+            
+            # Compute Y_p = y * X_p
+            # Product is in scale^2 domain
+            prod_i = (X_sh_i.astype(np.int64) * scalar_fixed).astype(np.int64)
+            
+            # Truncate back to scale^1 domain (simple shift)
+            # --- MODIFIED ---
+            trunc_i = np.right_shift(prod_i, FRAC_BITS).astype(np.int64)
+            
+            # Clamp and store
+            trunc_i = np.clip(trunc_i, INT64_MIN, INT64_MAX)
+            node_state.store[store_as] = trunc_i.view(np.uint64)
+            node_state.meta[store_as] = {'shape': tuple(trunc_i.shape), 'dtype': 'uint64'}
+            send_msg(conn, {'ok': True})
+            return
+        
         if typ == 'MAT_COMPUTE_D_E':
             X = node_state.store.get(req['X_key']); Y = node_state.store.get(req['Y_key'])
             a = node_state.store.get(req['a_key']); b = node_state.store.get(req['b_key'])
@@ -163,15 +282,17 @@ def handle_req(conn, addr, node_id):
                     Db[i][j] = s_db
                     aE[i][j] = s_aE
 
-            # truncation (rounding) elementwise, then assemble z
-            add = 1 << (FRAC_BITS - 1)
+            # truncation (simple shift) elementwise, then assemble z
+            # --- MODIFIED ---
             z_mat = [[0]*N for _ in range(M)]
             de_i = uint64_to_int64_arr(DE_share)
             for i in range(M):
                 for j in range(N):
                     # Db[i][j] and aE[i][j] are in scale^2 domain -> truncate
-                    t_db = (Db[i][j] + add) >> FRAC_BITS
-                    t_aE = (aE[i][j] + add) >> FRAC_BITS
+                    # --- MODIFIED ---
+                    t_db = Db[i][j] >> FRAC_BITS
+                    # --- MODIFIED ---
+                    t_aE = aE[i][j] >> FRAC_BITS
                     val = int(c_i[i,j]) + int(t_db) + int(t_aE) + int(de_i[i,j])
                     # clamp to int64 range
                     if val < INT64_MIN: val = INT64_MIN
