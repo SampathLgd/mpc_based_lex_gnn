@@ -1,0 +1,7 @@
+echo "
+venv_lex/
+__pycache__/
+*.pyc
+*.log
+*.pkl
+" > .gitignore
